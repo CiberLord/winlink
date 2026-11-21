@@ -20,5 +20,5 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
-      - run: .\test\windows.ps1
+      - run: .\test\windows.ps1 -SmokeOpenSSH
         shell: powershell

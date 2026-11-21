@@ -96,6 +96,62 @@ function Invoke-Native([string]$File, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$File exited with code $LASTEXITCODE." }
 }
 
+function Get-ManagedSshdConfig([string]$Username) {
+    $absoluteKeyFile = $keysPath.Replace('\', '/')
+    $absoluteHostKey = (Join-Path $sshRoot 'ssh_host_ed25519_key').Replace('\', '/')
+    return @"
+$marker
+Port 22
+AddressFamily inet
+HostKey "$absoluteHostKey"
+AuthorizedKeysFile "$absoluteKeyFile"
+AllowUsers "$Username"
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+AllowAgentForwarding no
+AllowTcpForwarding no
+LogLevel VERBOSE
+Subsystem sftp internal-sftp
+"@
+}
+
+function Initialize-SshdHostKey {
+    if (-not (Test-Path -LiteralPath $sshRoot)) {
+        New-Item -ItemType Directory -Path $sshRoot | Out-Null
+        Invoke-Native (Join-Path $env:WINDIR 'System32\icacls.exe') @(
+            $sshRoot, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)(F)',
+            '*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-11:(RX)')
+    }
+    Invoke-Native (Join-Path $sshBin 'ssh-keygen.exe') @('-A')
+}
+
+function Start-ManagedSshd([int]$Port = 22) {
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($listener) { throw "TCP port $Port is already in use by process $($listener.OwningProcess)." }
+
+    $start = Get-Date
+    try {
+        Start-Service -Name sshd
+        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'"
+        for ($attempt = 0; $attempt -lt 10; $attempt++) {
+            $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+                Where-Object { $_.OwningProcess -eq $service.ProcessId }
+            if ($listener) { return }
+            Start-Sleep -Milliseconds 300
+        }
+        throw "The service has no listener on TCP port $Port."
+    } catch {
+        $details = @($_.Exception.Message)
+        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
+        if ($service) { $details += "Windows service exit code: $($service.ExitCode)/$($service.ServiceSpecificExitCode)." }
+        $details += @(Get-WinEvent -FilterHashtable @{ LogName = 'OpenSSH/Operational'; StartTime = $start } `
+            -MaxEvents 5 -ErrorAction SilentlyContinue | ForEach-Object { $_.Message } | Where-Object { $_ })
+        throw ("OpenSSH startup failed:`n" + ($details -join "`n"))
+    }
+}
+
 function Set-SetupDirectory {
     if (Test-Path -LiteralPath $stateRoot) {
         $item = Get-Item -LiteralPath $stateRoot -Force
@@ -313,13 +369,7 @@ function Install-WinLink {
         $rule = Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue
         if ($rule) { $rule | Disable-NetFirewallRule }
 
-        if (-not (Test-Path -LiteralPath $sshRoot)) {
-            New-Item -ItemType Directory -Path $sshRoot | Out-Null
-            Invoke-Native (Join-Path $env:WINDIR 'System32\icacls.exe') @(
-                $sshRoot, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)(F)',
-                '*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-11:(RX)')
-        }
-        Invoke-Native (Join-Path $sshBin 'ssh-keygen.exe') @('-A')
+        Initialize-SshdHostKey
         $hostKey = Convert-PublicKey (Get-Content -LiteralPath (Join-Path $sshRoot 'ssh_host_ed25519_key.pub') -Raw)
         $pollPath = '/pair/v1/' + $nonce.ToString('D')
         Write-Host "Windows key code: $($hostKey.Code)"
@@ -335,49 +385,31 @@ function Install-WinLink {
         $stagedConfig = Join-Path $stage 'sshd_config'
         $stagedKeys = Join-Path $stage 'winlink_authorized_keys'
         Write-Utf8 $stagedKeys ('from="' + $MacIp + '" ' + $clientKey.Line + "`r`n")
-        $absoluteKeyFile = $keysPath.Replace('\', '/')
-        $absoluteHostKey = (Join-Path $sshRoot 'ssh_host_ed25519_key').Replace('\', '/')
-        Write-Utf8 $stagedConfig @"
-$marker
-Port 22
-AddressFamily inet
-HostKey "$absoluteHostKey"
-AuthorizedKeysFile "$absoluteKeyFile"
-AllowUsers "$username"
-AuthenticationMethods publickey
-PubkeyAuthentication yes
-PasswordAuthentication no
-AllowAgentForwarding no
-AllowTcpForwarding no
-LogLevel VERBOSE
-Subsystem sftp internal-sftp
-"@
+        Write-Utf8 $stagedConfig (Get-ManagedSshdConfig $username)
         Invoke-Native (Join-Path $sshBin 'sshd.exe') @('-t', '-f', $stagedConfig)
         if ((Get-Service -Name sshd).Status -ne 'Stopped') { Stop-Service -Name sshd -Force }
         Set-FileFrom $stagedConfig $configPath
+        Invoke-Native (Join-Path $sshBin 'sshd.exe') @('-t', '-f', $configPath)
         Set-FileFrom $stagedKeys $keysPath
         $keyReader = if (-not $isAdministrator) { $CallerSid }
         Set-Acl -LiteralPath $keysPath -AclObject (New-KeyFileAcl $keyReader)
         Remove-ManagedFirewallRule
         Add-ManagedFirewallRule $MacIp $network.InterfaceAlias
         Set-Service -Name sshd -StartupType Automatic
-        Start-Service -Name sshd
-
-        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'"
-        $isListening = $false
-        for ($attempt = 0; $attempt -lt 10 -and -not $isListening; $attempt++) {
-            $isListening = [bool](Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue |
-                Where-Object { $_.OwningProcess -eq $service.ProcessId })
-            if (-not $isListening) { Start-Sleep -Milliseconds 300 }
-        }
-        if (-not $isListening) { throw 'OpenSSH started without a listener on TCP port 22.' }
+        Start-ManagedSshd
 
         $null = Get-PairingJson 'POST' "$pollPath/ready"
         Remove-Item -LiteralPath $pending -Recurse -Force
         Write-Host "WinLink ready at $($network.IPAddress):22 for $username."
     } catch {
+        $failure = $_
         if ($pollPath) {
-            try { $null = Get-PairingJson 'POST' "$pollPath/failed" } catch { }
+            $message = $failure.Exception.Message
+            try {
+                $null = Get-PairingJson 'POST' "$pollPath/failed" @{
+                    message = $message.Substring(0, [Math]::Min($message.Length, 400))
+                }
+            } catch { }
         }
         if (Test-Path -LiteralPath $pending) {
             Restore-Snapshot $pending

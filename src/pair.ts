@@ -93,8 +93,13 @@ export async function pair(home: string, ip?: string): Promise<Profile> {
                     return reply(200, { phase })
                 }
                 if (request.method === 'POST' && request.url === `${pairPath}/${nonce}/failed` && candidate?.address === peer) {
+                    const body = await readBody(request)
+                    const detail = typeof body.message === 'string'
+                        ? body.message.slice(0, 400).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').trim()
+                        : ''
                     reply(200, { ok: true })
-                    controller.abort(new Error('Windows setup failed. See the Windows terminal.'))
+                    controller.abort(new Error(detail ? `Windows setup failed: ${detail}` :
+                        'Windows setup failed. See the Windows terminal.'))
                     return
                 }
                 if (request.method === 'POST' && request.url === `${pairPath}/${nonce}/ready`

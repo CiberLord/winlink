@@ -1,3 +1,5 @@
+param([switch]$SmokeOpenSSH)
+
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
@@ -5,7 +7,8 @@ $scriptPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'setup.ps1'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors -join "`n") }
 
-$names = @('Test-PrivateAddress', 'Test-SameSubnet', 'Convert-PublicKey', 'Write-Utf8', 'Set-FileFrom', 'New-KeyFileAcl')
+$names = @('Test-PrivateAddress', 'Test-SameSubnet', 'Convert-PublicKey', 'Write-Utf8', 'Set-FileFrom', 'New-KeyFileAcl',
+    'Invoke-Native', 'Get-ManagedSshdConfig', 'Initialize-SshdHostKey', 'Start-ManagedSshd')
 $definitions = $ast.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
@@ -70,3 +73,56 @@ try {
     }
 } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
 Write-Host 'Windows setup script checks passed.'
+
+if ($SmokeOpenSSH) {
+    $sshRoot = Join-Path $env:ProgramData 'ssh'
+    $sshBin = Join-Path $env:WINDIR 'System32\OpenSSH'
+    $configPath = Join-Path $sshRoot 'sshd_config'
+    $keysPath = Join-Path $sshRoot 'winlink_smoke_authorized_keys'
+    $marker = '# WinLink service startup smoke test'
+    $capability = 'OpenSSH.Server~~~~0.0.1.0'
+    if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
+        Add-WindowsCapability -Online -Name $capability | Out-Null
+    }
+    $service = Get-Service -Name sshd
+    $previousMode = $service.StartType
+    $wasRunning = $service.Status -eq 'Running'
+    if (Test-Path -LiteralPath $keysPath) { throw 'WinLink smoke key file already exists.' }
+
+    $socket = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+        $socket.Start()
+        $port = $socket.LocalEndpoint.Port
+    } finally { $socket.Stop() }
+
+    $temporary = Join-Path ([IO.Path]::GetTempPath()) ('winlink-sshd-test-' + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $temporary | Out-Null
+    $backup = Join-Path $temporary 'original_config'
+    $staged = Join-Path $temporary 'sshd_config'
+    $stagedKeys = Join-Path $temporary 'authorized_keys'
+    $hadConfig = Test-Path -LiteralPath $configPath
+    if ($hadConfig) { Copy-Item -LiteralPath $configPath -Destination $backup }
+    try {
+        if ($wasRunning) { Stop-Service -Name sshd -Force }
+        Initialize-SshdHostKey
+        $configuration = (Get-ManagedSshdConfig 'winlink-smoke') -replace '(?m)^Port 22\r?$', "Port $port`nListenAddress 127.0.0.1"
+        Write-Utf8 $staged $configuration
+        Write-Utf8 $stagedKeys $key
+        Invoke-Native (Join-Path $sshBin 'sshd.exe') @('-t', '-f', $staged)
+        Set-FileFrom $staged $configPath
+        Set-FileFrom $stagedKeys $keysPath
+        Set-Acl -LiteralPath $keysPath -AclObject (New-KeyFileAcl)
+        Invoke-Native (Join-Path $sshBin 'sshd.exe') @('-t', '-f', $configPath)
+        Set-Service -Name sshd -StartupType Manual
+        Start-ManagedSshd $port
+        Write-Host 'The Windows OpenSSH service started with the WinLink configuration.'
+    } finally {
+        if ((Get-Service -Name sshd).Status -ne 'Stopped') { Stop-Service -Name sshd -Force }
+        if (Test-Path -LiteralPath $keysPath) { Remove-Item -LiteralPath $keysPath -Force }
+        if ($hadConfig) { Set-FileFrom $backup $configPath }
+        elseif (Test-Path -LiteralPath $configPath) { Remove-Item -LiteralPath $configPath -Force }
+        Set-Service -Name sshd -StartupType $previousMode
+        if ($wasRunning) { Start-Service -Name sshd }
+        Remove-Item -LiteralPath $temporary -Recurse -Force
+    }
+}
