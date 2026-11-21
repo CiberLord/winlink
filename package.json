@@ -1,12 +1,18 @@
 {
   "name": "winlink",
   "version": "0.1.0",
-  "description": "Manage your Windows PC from your Mac using OpenSSH",
+  "description": "Manage your Windows PC from your Mac over HTTPS",
   "license": "MIT",
   "type": "module",
-  "bin": { "winlink": "dist/cli.js" },
-  "files": ["dist"],
-  "engines": { "node": ">=22" },
+  "bin": {
+    "winlink": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc",
     "test": "npm run build && node --test test/*.test.mjs",
@@ -15,5 +21,8 @@
   "devDependencies": {
     "@types/node": "^22.18.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "selfsigned": "5.5.0"
   }
 }

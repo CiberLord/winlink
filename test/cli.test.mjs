@@ -1,13 +1,12 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { spawn, spawnSync } from 'node:child_process'
+import { once } from 'node:events'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
-import { displayCode, download, isLanAddress, prepareConnection, publicKey, remotePath } from '../dist/ssh.js'
-
-const key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+import { certificateCode as windowsCode, startAgent } from '../windows/agent.mjs'
+import { certificateCode, discoverCertificate, download, list, powershell, probe, register, upload } from '../dist/transport.js'
 
 async function fixture(t) {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'winlink-test-'))
@@ -15,80 +14,78 @@ async function fixture(t) {
     return directory
 }
 
-test('only canonical private LAN addresses and valid Ed25519 public keys are accepted', () => {
-    assert.ok(isLanAddress('192.168.1.10'))
-    assert.ok(isLanAddress('172.31.1.10'))
-    for (const invalid of ['172.32.1.10', '192.168.001.10', 'ciberlord.com', '::1', '127.0.0.1']) {
-        assert.equal(isLanAddress(invalid), false)
-    }
-    assert.equal(publicKey(key + ' winlink'), key)
-    assert.throws(() => publicKey(key.replace('AAAAC3', 'AAAAA3')), /Ed25519/)
-    assert.throws(() => publicKey('command="echo hello" ' + key), /Ed25519/)
-    assert.equal(displayCode(key), 'kmYc-vdi2-GkPe-WxB6')
-})
+async function stop(server) {
+    if (!server.listening) return
+    const closed = new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    server.closeAllConnections()
+    await closed
+}
 
-test('the OpenSSH configuration pins the entire approved host key', async t => {
+test('authorized HTTPS pairing, certificate pinning, PowerShell and binary files', async t => {
     const home = await fixture(t)
-    const config = await prepareConnection(home, { address: '192.168.1.10', user: 'standard user', hostKey: key })
-    const file = path.join(home, 'ssh_config')
-    await writeFile(file, config)
-    const resolved = spawnSync('ssh', ['-F', file, '-G', 'winlink-windows'], { encoding: 'utf8' })
-    assert.equal(resolved.status, 0)
-    assert.match(resolved.stdout, /^stricthostkeychecking true$/m)
-    assert.match(resolved.stdout, /^user standard user$/m)
-    const known = /^userknownhostsfile (.*)$/m.exec(resolved.stdout)[1]
-    assert.equal(await readFile(known, 'utf8'), `winlink-windows ${key}\n`)
-    await assert.rejects(() => prepareConnection(home, {
-        address: '192.168.1.10', user: 'bad\nProxyCommand', hostKey: key,
-    }))
-})
-
-test('Windows paths preserve Unicode and reject paths that could split a batch command', () => {
-    assert.equal(remotePath('C:\\My Mods\\Мод [test].zip'), 'C:/My Mods/Мод [test].zip')
-    assert.equal(remotePath('/C:/My Mods/Мод.zip'), 'C:/My Mods/Мод.zip')
-    assert.throws(() => remotePath('c:relative'))
-    assert.throws(() => remotePath('C:/bad\nbye'))
-})
-
-test('native SFTP downloads a literal Unicode path and preserves existing files', async t => {
-    const sftpServer = process.platform === 'darwin' ? '/usr/libexec/sftp-server' : '/usr/lib/openssh/sftp-server'
+    const root = path.join(home, 'files')
+    const stateDirectory = path.join(home, 'state')
+    await mkdir(root)
+    const options = { address: '127.0.0.1', macIp: '127.0.0.1', stateDirectory, root, listenPort: 0 }
+    const agent = await startAgent(options)
     try {
-        await access(sftpServer)
-    } catch {
-        t.skip('Native OpenSSH SFTP server is not installed')
-        return
+        const certificate = await discoverCertificate(agent.address, agent.port)
+        assert.equal(certificateCode(certificate), windowsCode(agent.certificate))
+        const server = { address: agent.address, certificate, port: agent.port }
+        await assert.rejects(register(server, agent.pairingPin === '00000000' ? '11111111' : '00000000'), /PIN did not match/)
+        const unauthorized = await probe({ ...server, user: '', token: '1'.repeat(43) }, 5)
+        assert.equal(unauthorized.ok, false)
+        assert.match(unauthorized.checks.https.detail, /authentication/)
+        const profile = await register(server, agent.pairingPin)
+        await assert.rejects(register(server, agent.pairingPin), /Pairing is closed/)
+        await assert.rejects(startAgent({ ...options, listenPort: agent.port, pairAgain: true }), { code: 'EADDRINUSE' })
+        const status = await probe(profile, 5)
+        assert.equal(status.checks.https.ok, true)
+        assert.equal(status.checks.files.ok, true)
+        if (process.platform === 'win32') {
+            assert.equal(status.ok, true)
+            const shell = await powershell(profile, "'Привет'; exit 7", 5)
+            assert.equal(shell.stdout.trim(), 'Привет')
+            assert.equal(shell.exitCode, 7)
+            assert.equal((await powershell(profile, 'Start-Sleep -Seconds 5', 1)).timedOut, true)
+        }
+
+        const source = path.join(home, 'source')
+        const remote = path.join(root, 'Мод [a].zip')
+        const destination = path.join(home, 'download')
+        const bytes = Buffer.from([0x00, 0xff, 0x0a, 0x35])
+        await writeFile(source, bytes)
+        await upload(profile, source, remote, 5)
+        await writeFile(source, 'replacement')
+        await assert.rejects(upload(profile, source, remote, 5), /exist/i)
+        await download(profile, remote, destination, 5)
+        assert.deepEqual(await readFile(destination), bytes)
+        await assert.rejects(download(profile, remote, destination, 5), { code: 'EEXIST' })
+        assert.deepEqual(await readdir(root), ['Мод [a].zip'])
+        assert.equal((await list(profile, '.', 5))[0].name, 'Мод [a].zip')
+        assert.equal((await list(profile, '.', 5))[0].size, bytes.length)
+
+        const different = await startAgent({ ...options, stateDirectory: path.join(home, 'different') })
+        try {
+            const mismatched = await probe({ ...profile, port: different.port }, 5)
+            assert.equal(mismatched.checks.https.ok, false)
+            assert.match(mismatched.checks.https.detail, /certificate|verify/i)
+        } finally {
+            await stop(different.server)
+        }
+
+        await stop(agent.server)
+        const restarted = await startAgent(options)
+        try {
+            assert.equal(restarted.pairingPin, null)
+            const report = await probe({ ...profile, port: restarted.port }, 5)
+            assert.equal(report.checks.https.ok, true)
+        } finally {
+            await stop(restarted.server)
+        }
+    } finally {
+        await stop(agent.server)
     }
-
-    const home = await fixture(t)
-    const remote = path.join(home, 'remote')
-    const bin = path.join(home, 'bin')
-    const local = path.join(home, 'local')
-    for (const directory of [remote, bin, local]) await mkdir(directory)
-    const originalPath = path.join(remote, 'Мод [a].zip')
-    const target = path.join(local, 'Мод копия.zip')
-    const original = Buffer.from([0x00, 0xff, 0x0a, 0x35])
-    await writeFile(originalPath, original)
-    await writeFile(path.join(remote, 'Мод a.zip'), 'wrong')
-    const command = `#!${process.execPath}
-const fs = require('node:fs');
-const cp = require('node:child_process');
-const input = fs.readFileSync(0, 'utf8').replace('/C:/', ${JSON.stringify(remote + '/')});
-const result = cp.spawnSync('/usr/bin/sftp', ['-q', '-D', ${JSON.stringify(sftpServer)}, '-b', '-'],
-    { input, stdio: ['pipe', 'inherit', 'inherit'] });
-process.exit(result.status ?? 1);
-`
-    await writeFile(path.join(bin, 'sftp'), command, { mode: 0o700 })
-    const oldPath = process.env.PATH
-    process.env.PATH = `${bin}:${oldPath}`
-    t.after(() => { process.env.PATH = oldPath })
-
-    await download('unused', 'C:/Мод [a].zip', target, 5)
-    const digest = data => createHash('sha256').update(data).digest('hex')
-    assert.equal(digest(await readFile(target)), digest(original))
-    await assert.rejects(download('unused', 'C:/Мод a.zip', target, 5), { code: 'EEXIST' })
-    assert.deepEqual(await readFile(target), original)
-    await assert.rejects(download('unused', 'C:/absent.zip', path.join(local, 'missing'), 5), /Download failed/)
-    assert.deepEqual(await readdir(local), ['Мод копия.zip'])
 })
 
 test('CLI returns a structured error before pairing', async t => {
@@ -101,9 +98,50 @@ test('CLI returns a structured error before pairing', async t => {
     assert.deepEqual(JSON.parse(result.stdout), {
         version: 1,
         ok: false,
-        error: 'No active profile. Run winlink pair on the Mac first.',
+        error: 'No active profile. Run winlink pair with the Windows IP first.',
     })
-    const log = JSON.parse(await readFile(path.join(home, 'operations.jsonl'), 'utf8'))
+    const logfile = await readFile(path.join(home, 'operations.jsonl'), 'utf8')
+    const log = JSON.parse(logfile)
     assert.equal(log.command, 'doctor')
     assert.equal(log.ok, false)
+})
+
+test('Windows setup.cmd starts the Node agent under the invoking profile', {
+    skip: process.platform !== 'win32', timeout: 20_000,
+}, async t => {
+    const home = await fixture(t)
+    const child = spawn('cmd.exe', ['/d', '/c', 'setup.cmd', '127.0.0.1'], {
+        env: { ...process.env, LOCALAPPDATA: home },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const closed = once(child, 'close')
+    let output = ''
+    try {
+        await new Promise((resolve, reject) => {
+            const until = setTimeout(() => reject(new Error('Launcher timed out: ' + output)), 12_000)
+            function finish(error) {
+                clearTimeout(until)
+                if (error) reject(error)
+                else resolve()
+            }
+            child.stdout.on('data', data => {
+                output += data
+                if (/Pairing PIN \(valid 10 minutes\): \d{8}/.test(output)) finish()
+            })
+            child.stderr.on('data', data => { output += data })
+            child.once('error', finish)
+            child.once('exit', code => finish(new Error(`Launcher exited ${code}: ${output}`)))
+        })
+        const certificate = await discoverCertificate('127.0.0.1')
+        assert.match(output, /WinLink is listening/)
+        const pin = /Pairing PIN \(valid 10 minutes\): (\d{8})/.exec(output)[1]
+        const profile = await register({ address: '127.0.0.1', certificate }, pin)
+        assert.equal((await probe(profile, 5)).ok, true)
+    } finally {
+        if (child.exitCode === null) {
+            spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+            child.kill()
+        }
+        await closed
+    }
 })

@@ -1,19 +1,19 @@
 #!/usr/bin/env node
-import { access, appendFile } from 'node:fs/promises'
+import { appendFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { parseArgs } from 'node:util'
 import { pair } from './pair.js'
-import { download, list, powershell, prepareHome, probe, upload } from './ssh.js'
+import { download, list, loadProfile, powershell, probe, upload } from './transport.js'
 
 const home = path.resolve(process.env.WINLINK_HOME ?? path.join(os.homedir(), '.winlink'))
-const config = path.join(home, 'ssh_config')
+const config = path.join(home, 'https_profile.json')
 const help = `Usage: winlink <command>
 
-  pair [--ip MAC_IP]                     Pair a Windows PC
-  doctor [--json]                       Check TCP, SSH, PowerShell and SFTP
+  pair WINDOWS_IP                       Pair a Windows PC
+  doctor [--json]                       Check HTTPS, PowerShell and file access
   exec [--json] '<PowerShell>'          Run a PowerShell command
-  ls [--json] [WINDOWS_DIR]             List a directory (default: SSH working directory)
+  ls [--json] [WINDOWS_DIR]             List a directory (default: Windows user profile)
   get [--json] WINDOWS_FILE MAC_FILE    Download a file
   put [--json] MAC_FILE WINDOWS_FILE    Upload a file
 
@@ -28,10 +28,9 @@ async function main() {
     }
 
     if (command === 'pair') {
-        const { values } = parseArgs({ args, options: { ip: { type: 'string' } } })
-        await prepareHome(home)
-        const profile = await pair(home, values.ip)
-        console.log(`Connected to ${profile.address} as ${profile.user}. SSH, PowerShell and SFTP passed.`)
+        if (args.length !== 1) throw new Error('Usage: winlink pair WINDOWS_IP')
+        const profile = await pair(config, args[0])
+        console.log(`Paired with ${profile.address} as ${profile.user}. Use winlink doctor to check access.`)
         return
     }
 
@@ -47,11 +46,11 @@ async function main() {
             || !Number.isInteger(timeout) || timeout < 1 || timeout > 3600) {
             throw new Error('Invalid command, arguments or timeout. See winlink --help.')
         }
-        await access(config).catch(() => { throw new Error('No active profile. Run winlink pair on the Mac first.') })
+        const profile = await loadProfile(config)
         let result: unknown
         let exit = 0
         if (command === 'exec') {
-            const execution = await powershell(config, positionals[0], timeout)
+            const execution = await powershell(profile, positionals[0], timeout)
             result = execution
             exit = execution.timedOut ? 124 : execution.exitCode
             if (!values.json) {
@@ -60,13 +59,13 @@ async function main() {
                 if (execution.timedOut) process.stderr.write('PowerShell command timed out.\n')
             }
         } else if (command === 'doctor') {
-            const report = await probe(config, timeout)
+            const report = await probe(profile, timeout)
             result = report
             exit = report.ok ? 0 : 1
         } else if (command === 'ls') {
-            result = await list(config, positionals[0] ?? '.', timeout)
+            result = await list(profile, positionals[0] ?? '.', timeout)
         } else {
-            await (command === 'get' ? download : upload)(config, positionals[0], positionals[1], timeout)
+            await (command === 'get' ? download : upload)(profile, positionals[0], positionals[1], timeout)
             result = { destination: positionals[1] }
         }
         success = exit === 0
