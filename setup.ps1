@@ -1,6 +1,7 @@
 param(
     [Parameter(Position = 0)][string]$MacIp,
     [ValidateSet('Install', 'Status', 'Rollback')][string]$Mode = 'Install',
+    [switch]$AllowAdministrator,
     [string]$CallerSid
 )
 
@@ -17,6 +18,7 @@ $defaultRule = 'OpenSSH-Server-In-TCP'
 $managedRule = 'WinLink-OpenSSH-In'
 $capability = 'OpenSSH.Server~~~~0.0.1.0'
 $marker = '# Managed by WinLink'
+$keyAclSections = [Security.AccessControl.AccessControlSections]'Access, Owner, Group'
 
 function Test-PrivateAddress([string]$Value) {
     $address = $null
@@ -71,6 +73,22 @@ function Set-FileFrom([string]$Source, [string]$Destination) {
     } finally {
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Force }
     }
+}
+
+function New-KeyFileAcl([string]$UserSid) {
+    $acl = [Security.AccessControl.FileSecurity]::new()
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $admins = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $acl.SetOwner($admins)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($system, $admins)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'Allow'))
+    }
+    if ($UserSid) {
+        $user = [Security.Principal.SecurityIdentifier]::new($UserSid)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($user, 'Read', 'Allow'))
+    }
+    return $acl
 }
 
 function Invoke-Native([string]$File, [string[]]$Arguments) {
@@ -136,6 +154,10 @@ function Save-Snapshot([string]$Directory) {
         foreach ($file in @($configPath, $keysPath)) {
             if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $stage }
         }
+        if (Test-Path -LiteralPath $keysPath) {
+            $acl = Get-Acl -LiteralPath $keysPath
+            Write-Utf8 (Join-Path $stage 'keys.sddl') ($acl.GetSecurityDescriptorSddlForm($keyAclSections))
+        }
         $mode = 'Disabled'
         $running = $false
         if ($service) {
@@ -162,6 +184,12 @@ function Restore-Snapshot([string]$Directory) {
         $saved = Join-Path $Directory ([IO.Path]::GetFileName($file))
         if (Test-Path -LiteralPath $saved) { Set-FileFrom $saved $file }
         elseif (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+    }
+    $savedAcl = Join-Path $Directory 'keys.sddl'
+    if (Test-Path -LiteralPath $savedAcl) {
+        $acl = Get-Acl -LiteralPath $keysPath
+        $acl.SetSecurityDescriptorSddlForm([IO.File]::ReadAllText($savedAcl), $keyAclSections)
+        Set-Acl -LiteralPath $keysPath -AclObject $acl
     }
 
     $rule = Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue
@@ -210,8 +238,12 @@ function Install-WinLink {
     $user = Get-LocalUser -SID ([Security.Principal.SecurityIdentifier]::new($CallerSid))
     if (-not $user.Enabled) { throw 'The selected Windows account is disabled.' }
     $admins = Get-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
-    if ($CallerSid -in @($admins | ForEach-Object { $_.SID.Value })) {
-        throw 'Sign in to your standard Windows account before running setup.'
+    $isAdministrator = $CallerSid -in @($admins | ForEach-Object { $_.SID.Value })
+    if ($isAdministrator -and -not $AllowAdministrator) {
+        throw 'This Windows account is an administrator. To pair it, rerun setup with -AllowAdministrator.'
+    }
+    if ($isAdministrator) {
+        Write-Host "Pairing $($user.Name). SSH access from the paired Mac will have administrator permissions."
     }
     $username = $user.Name.ToLowerInvariant()
     if ($username -notmatch '^[\p{L}\p{N}_. -]{1,20}$' -or $username.StartsWith('-') -or $username.Trim() -cne $username) {
@@ -324,9 +356,8 @@ Subsystem sftp internal-sftp
         if ((Get-Service -Name sshd).Status -ne 'Stopped') { Stop-Service -Name sshd -Force }
         Set-FileFrom $stagedConfig $configPath
         Set-FileFrom $stagedKeys $keysPath
-        Invoke-Native (Join-Path $env:WINDIR 'System32\icacls.exe') @(
-            $keysPath, '/inheritance:r', '/grant:r', '*S-1-5-18:(F)', '*S-1-5-32-544:(F)', ('*' + $CallerSid + ':(R)'))
-        Invoke-Native (Join-Path $env:WINDIR 'System32\icacls.exe') @($keysPath, '/setowner', '*S-1-5-32-544')
+        $keyReader = if (-not $isAdministrator) { $CallerSid }
+        Set-Acl -LiteralPath $keysPath -AclObject (New-KeyFileAcl $keyReader)
         Remove-ManagedFirewallRule
         Add-ManagedFirewallRule $MacIp $network.InterfaceAlias
         Set-Service -Name sshd -StartupType Automatic
@@ -367,8 +398,9 @@ try {
     }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not $CallerSid) {
-        if ($Mode -eq 'Install' -and 'S-1-5-32-544' -in @($identity.Groups | ForEach-Object { $_.Value })) {
-            throw 'Run setup from the standard Windows account you want to access.'
+        if ($Mode -eq 'Install' -and -not $AllowAdministrator -and
+            'S-1-5-32-544' -in @($identity.Groups | ForEach-Object { $_.Value })) {
+            throw 'This Windows account is an administrator. To pair it, rerun setup with -AllowAdministrator.'
         }
         $CallerSid = $identity.User.Value
     }
@@ -380,6 +412,7 @@ try {
         $params = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $PSCommandPath + '"'),
             '-Mode', $Mode, '-CallerSid', $CallerSid)
         if ($MacIp) { $params += @('-MacIp', $MacIp) }
+        if ($AllowAdministrator) { $params += '-AllowAdministrator' }
         $elevated = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -ArgumentList $params -Wait -PassThru
         exit $elevated.ExitCode
     }
