@@ -212,7 +212,7 @@ export async function upload(config: string, source: string, destination: string
         const script = `$ErrorActionPreference = 'Stop'; [IO.File]::Move(${literal(stage)}, ${literal(target)})`
         check(await powershell(config, script, timeout), 'Could not publish uploaded file')
     } catch (error) {
-        const script = `Remove-Item -LiteralPath ${literal(stage)} -ErrorAction SilentlyContinue`
+        const script = `Remove-Item -LiteralPath ${literal(stage)} -Force -ErrorAction SilentlyContinue`
         await powershell(config, script, Math.min(timeout, 5)).catch(() => undefined)
         throw error
     }
